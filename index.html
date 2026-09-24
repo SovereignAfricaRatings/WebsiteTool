@@ -100,7 +100,7 @@ select{background:var(--panel); border:1px solid var(--rule); border-radius:5px;
 .status{display:inline-flex; align-items:center; gap:7px; border:1px solid var(--rule); background:var(--panel); border-radius:999px; padding:5px 11px; font-size:13px; cursor:pointer; color:var(--ink2); text-decoration:none; white-space:nowrap}
 .status i{width:8px; height:8px; border-radius:50%; background:var(--muted); flex:none}
 .status.live i{background:var(--live); box-shadow:0 0 0 3px color-mix(in srgb,var(--live) 22%,transparent)}
-.status.partial i{background:var(--gold)}
+.status.cached i{background:var(--gold)}
 .status.loading i{background:var(--gold); animation:pulse 1s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.25}}
 .screens{padding:20px 28px 40px; max-width:1720px; width:100%; margin:0 auto}
@@ -403,7 +403,7 @@ dl.facts dt{color:var(--muted)} dl.facts dd{margin:0}
       </section>
 
       <section class="screen" data-screen="data" hidden>
-        <div class="scr-head"><div><h2>Data and methodology</h2><p id="data-lead"></p></div><button class="btn pri" type="button" id="refresh">Refresh live data</button></div>
+        <div class="scr-head"><div><h2>Data and methodology</h2><p id="data-lead"></p></div><button class="btn pri" type="button" id="refresh">Check for a new update</button></div>
         <div class="panel tbl-wrap"><table class="log" id="log"></table></div>
         <h3 class="sec-t">Indicator definitions</h3>
         <div class="panel tbl-wrap"><table class="defs" id="defs"></table></div>
@@ -419,7 +419,7 @@ dl.facts dt{color:var(--muted)} dl.facts dd{margin:0}
         <div id="cta-wrap" style="margin-top:14px"></div>
         <div class="docs" style="margin-top:26px">
           <div><h3>How the figures are built</h3><p>Headline fiscal, current-account, growth and inflation figures are three-year averages of the latest actual years; debt and revenue are the latest actual year. IMF projections appear only in trend charts, shaded. Debt to revenue divides gross debt by revenue. Dollar values multiply a published ratio by nominal GDP. Continental figures are ratios of continental totals, so larger economies weigh more; reserve cover is weighted by imports and resource dependence by exports.</p>
-          <p>Every live value passes a plausibility check before it is used. Values outside the range are held back and listed in the connector log, and the snapshot value stays in place.</p></div>
+          <p>Updates are all or nothing. A scheduled job pulls every series from the IMF and World Bank, checks each value for plausibility and each series for coverage, and publishes a new data file only when the whole set is complete. If any source fails, the previous complete update stays in use, so figures from different pulls are never mixed.</p></div>
           <div><h3>What is left out, and why</h3><p>Euro-area members hold reserves within the euro system, so national reserve cover is shown as not applicable. External debt comes from World Bank debt statistics, which cover low- and middle-income economies only. Where a sovereign does not publish a series, the gap is shown rather than estimated.</p>
           <h3>What this tool is not</h3><p>Nothing here is a credit rating, a rating outlook or an indication of one, and nothing here is investment advice. AfCRA's ratings are issued only through its formal rating process.</p></div>
         </div>
@@ -436,8 +436,12 @@ dl.facts dt{color:var(--muted)} dl.facts dd{margin:0}
    CONFIGURATION
    ====================================================================== */
 const CONFIG = {
-  /* Live sources. Point these at your own proxy or cache in production so
-     visitors don't hit the public APIs directly (see the notes at the end). */
+  /* Primary feed: the complete data file produced by build-data.mjs on a
+     schedule and hosted next to this page. Loaded all or nothing. */
+  dataUrl: "sovereign-data.json",
+  /* If that file can't be loaded, try the public APIs from the browser.
+     Also all or nothing: applied only if every series loads. */
+  directFallback: true,
   sources: {
     imf: "https://www.imf.org/external/datamapper/api/v1",
     wb: "https://api.worldbank.org/v2",
@@ -495,21 +499,21 @@ const exportGroupOf = (item) => (EXPORT_GROUPS.find(g => g.items.includes(item))
 const NOW_Y = new Date().getFullYear();
 const ACTUAL_TO = NOW_Y - 1;               // later years in IMF series are projections
 const REGISTRY = [
-  { k:"debt",  p:"IMF", code:"GGXWDG_NGDP",       t:"latest", label:"General government gross debt, % of GDP", range:[0,600] },
-  { k:"rev",   p:"IMF", code:"GGR_NGDP",          t:"latest", label:"General government revenue, % of GDP", range:[0,120] },
-  { k:"fb",    p:"IMF", code:"GGXCNL_NGDP",       t:"mean3",  label:"Net lending/borrowing (fiscal balance), % of GDP", range:[-100,100] },
-  { k:"ca",    p:"IMF", code:"BCA_NGDPD",         t:"mean3",  label:"Current account balance, % of GDP", range:[-150,150] },
-  { k:"g",     p:"IMF", code:"NGDP_RPCH",         t:"mean3",  label:"Real GDP growth, %", range:[-80,120] },
-  { k:"cpi",   p:"IMF", code:"PCPIPCH",           t:"mean3",  label:"Consumer price inflation, %", range:[-30,25000] },
-  { k:"gdp",   p:"IMF", code:"NGDPD",             t:"latest", label:"Nominal GDP, US$ billions", range:[0,60000] },
-  { k:"popm",  p:"IMF", code:"LP",                t:"latest", label:"Population, millions", range:[0,2000] },
-  { k:"res",   p:"WB",  code:"FI.RES.TOTL.MO",    t:"latest", label:"Total reserves in months of imports", range:[0,120] },
-  { k:"xd",    p:"WB",  code:"DT.DOD.DECT.GN.ZS", t:"latest", label:"External debt stocks, % of GNI", range:[0,3000] },
-  { k:"mva",   p:"WB",  code:"NV.IND.MANF.ZS",    t:"latest", label:"Manufacturing value added, % of GDP", range:[0,100] },
-  { k:"fuel",  p:"WB",  code:"TX.VAL.FUEL.ZS.UN", t:"latest", label:"Fuel exports, % of merchandise exports", range:[0,100] },
-  { k:"ores",  p:"WB",  code:"TX.VAL.MMTL.ZS.UN", t:"latest", label:"Ores and metals exports, % of merchandise exports", range:[0,100] },
-  { k:"exp",   p:"WB",  code:"NE.EXP.GNFS.ZS",    t:"latest", label:"Exports of goods and services, % of GDP", range:[0,500] },
-  { k:"imp",   p:"WB",  code:"NE.IMP.GNFS.ZS",    t:"latest", label:"Imports of goods and services, % of GDP", range:[0,500] },
+  { k:"debt",  p:"IMF", code:"GGXWDG_NGDP",       t:"latest", label:"General government gross debt, % of GDP", range:[0,600], min:90 },
+  { k:"rev",   p:"IMF", code:"GGR_NGDP",          t:"latest", label:"General government revenue, % of GDP", range:[0,120], min:90 },
+  { k:"fb",    p:"IMF", code:"GGXCNL_NGDP",       t:"mean3",  label:"Net lending/borrowing (fiscal balance), % of GDP", range:[-100,100], min:90 },
+  { k:"ca",    p:"IMF", code:"BCA_NGDPD",         t:"mean3",  label:"Current account balance, % of GDP", range:[-150,150], min:85 },
+  { k:"g",     p:"IMF", code:"NGDP_RPCH",         t:"mean3",  label:"Real GDP growth, %", range:[-80,120], min:90 },
+  { k:"cpi",   p:"IMF", code:"PCPIPCH",           t:"mean3",  label:"Consumer price inflation, %", range:[-30,25000], min:90 },
+  { k:"gdp",   p:"IMF", code:"NGDPD",             t:"latest", label:"Nominal GDP, US$ billions", range:[0,60000], min:90 },
+  { k:"popm",  p:"IMF", code:"LP",                t:"latest", label:"Population, millions", range:[0,2000], min:85 },
+  { k:"res",   p:"WB",  code:"FI.RES.TOTL.MO",    t:"latest", label:"Total reserves in months of imports", range:[0,120], min:45 },
+  { k:"xd",    p:"WB",  code:"DT.DOD.DECT.GN.ZS", t:"latest", label:"External debt stocks, % of GNI", range:[0,3000], min:40 },
+  { k:"mva",   p:"WB",  code:"NV.IND.MANF.ZS",    t:"latest", label:"Manufacturing value added, % of GDP", range:[0,100], min:85 },
+  { k:"fuel",  p:"WB",  code:"TX.VAL.FUEL.ZS.UN", t:"latest", label:"Fuel exports, % of merchandise exports", range:[0,100], min:75 },
+  { k:"ores",  p:"WB",  code:"TX.VAL.MMTL.ZS.UN", t:"latest", label:"Ores and metals exports, % of merchandise exports", range:[0,100], min:75 },
+  { k:"exp",   p:"WB",  code:"NE.EXP.GNFS.ZS",    t:"latest", label:"Exports of goods and services, % of GDP", range:[0,500], min:85 },
+  { k:"imp",   p:"WB",  code:"NE.IMP.GNFS.ZS",    t:"latest", label:"Imports of goods and services, % of GDP", range:[0,500], min:85 },
 ];
 const IMF_ALIAS = { UVK:"XKX" };            // IMF codes that differ from ISO 3166
 const PROVIDER = { IMF:"IMF World Economic Outlook", WB:"World Bank WDI / IDS" };
@@ -565,11 +569,34 @@ function transform(series, t, provider) {
   if (t === "mean3") { const w = actual.slice(-3); return { value: w.reduce((a, p) => a + p[1], 0) / w.length, period: w.length > 1 ? `${w[0][0]}–${w[w.length-1][0]}` : `${w[0][0]}` }; }
   const p = actual[actual.length - 1]; return { value:p[1], period:`${p[0]}` };
 }
-const LIVE = { status:"idle", jobs:[], staged:null, at:null, quarantine:[] };
-async function runIngestion() {
-  LIVE.status = "loading"; LIVE.jobs = REGISTRY.map(r => ({ ...r, status:"queued", rows:0, ms:0, vintage:null, error:null }));
-  LIVE.quarantine = []; renderStatus(); if (route.screen === "data") renderData();
-  const staged = {}, down = {};
+const LIVE = { status:"idle", jobs:[], staged:null, at:null, quarantine:[], via:null, attempt:null };
+/* A pull is accepted only if every series loaded and met its minimum coverage.
+   Otherwise nothing is applied and the last complete dataset stays in use. */
+const complete = jobs => jobs.length === REGISTRY.length && jobs.every(j => j.status === "ok");
+function accept(staged, jobs, at, via, sources) {
+  LIVE.staged = staged; LIVE.jobs = jobs; LIVE.at = at; LIVE.via = via; LIVE.sources = sources || null; LIVE.cached = false;
+  try { localStorage.setItem("afcra-sf-live", JSON.stringify({ at, staged, jobs, via, sources })); } catch (e) {}
+  applyLive(staged);
+}
+async function loadBuilt() {
+  const a = { via:"file", jobs:[], error:null };
+  try {
+    const url = CONFIG.dataUrl + (CONFIG.dataUrl.includes("?") ? "&" : "?") + "v=" + Math.floor(Date.now() / 3600e3);
+    const json = await fetchJson(url, { retries:1, timeout:20000 });
+    if (!json || json.complete !== true || !json.staged || !Array.isArray(json.jobs)) throw new Error("data file is missing or marked incomplete");
+    const jobs = REGISTRY.map(r => { const j = json.jobs.find(x => x.k === r.k) || {}; const rows = Object.values(json.staged).filter(s => s.v && has(s.v[r.k])).length;
+      return { ...r, status: rows >= r.min ? "ok" : "short", rows, ms:j.ms || 0, vintage:j.vintage || null, route:j.route || null, error: rows >= r.min ? null : `covered ${rows}, minimum ${r.min}` }; });
+    a.jobs = jobs;
+    if (!complete(jobs)) throw new Error("data file failed the completeness check");
+    LIVE.quarantine = json.quarantine || [];
+    accept(json.staged, jobs, json.generatedAt || new Date().toISOString(), "file", json.sources);
+    return a;
+  } catch (e) { a.error = e?.message || String(e); return a; }
+}
+async function runDirect() {
+  const jobs = REGISTRY.map(r => ({ ...r, status:"queued", rows:0, ms:0, vintage:null, error:null }));
+  const a = { via:"direct", jobs, error:null }; LIVE.attempt = a;
+  const staged = {}, down = {}, quarantine = [];
   const run = async (job) => {
     if (down[job.p]) { job.status = "failed"; job.error = "source unreachable from this browser"; return; }
     job.status = "running"; const t0 = performance.now();
@@ -579,33 +606,37 @@ async function runIngestion() {
       for (const [iso, series] of Object.entries(data)) {
         const r = transform(series, job.t, job.p);
         if (!r) continue;
-        if (r.value < job.range[0] || r.value > job.range[1]) { LIVE.quarantine.push({ iso, k:job.k, value:r.value }); continue; }
+        if (r.value < job.range[0] || r.value > job.range[1]) { quarantine.push({ iso, k:job.k, value:r.value }); continue; }
         const s = staged[iso] = staged[iso] || { v:{}, src:{}, series:{} };
         s.v[job.k] = r.value; s.src[job.k] = { p:job.p, code:job.code, period:r.period, vintage };
         s.series[job.k] = series; job.rows++;
       }
-      job.status = job.rows ? "ok" : "empty";
+      job.status = job.rows >= job.min ? "ok" : "short";
+      if (job.status === "short") job.error = `covered ${job.rows}, minimum ${job.min}`;
     } catch (e) { job.status = "failed"; job.error = e?.message || String(e); if (e instanceof TypeError || e?.name === "AbortError") down[job.p] = true; }
     job.ms = Math.round(performance.now() - t0);
     if (route.screen === "data") renderData();
   };
-  const imf = LIVE.jobs.filter(j => j.p === "IMF"), wb = LIVE.jobs.filter(j => j.p === "WB");
-  const imfChain = (async () => { for (const j of imf) await run(j); })();
-  const wbPool = (async () => { const q = [...wb]; await Promise.all([0,1,2].map(async () => { while (q.length) await run(q.shift()); })); })();
-  await Promise.all([imfChain, wbPool]);
-  const ok = LIVE.jobs.filter(j => j.status === "ok").length;
-  LIVE.status = ok === LIVE.jobs.length ? "live" : ok ? "partial" : "offline";
-  if (ok) {
-    LIVE.staged = staged; LIVE.at = new Date().toISOString();
-    try { localStorage.setItem("afcra-sf-live", JSON.stringify({ at:LIVE.at, staged, jobs:LIVE.jobs })); } catch (e) {}
-    applyLive(staged);
-  }
+  const imfJobs = jobs.filter(j => j.p === "IMF"), wbJobs = jobs.filter(j => j.p === "WB");
+  await Promise.all([(async () => { for (const j of imfJobs) await run(j); })(),
+    (async () => { const q = [...wbJobs]; await Promise.all([0,1,2].map(async () => { while (q.length) await run(q.shift()); })); })()]);
+  if (complete(jobs)) { LIVE.quarantine = quarantine; accept(staged, jobs, new Date().toISOString(), "direct", null); }
+  else a.error = `${jobs.filter(j => j.status !== "ok").length} of ${jobs.length} series did not load`;
+  return a;
+}
+async function runIngestion() {
+  LIVE.status = "loading"; LIVE.attempt = null; renderStatus(); if (route.screen === "data") renderData();
+  let a = null, ok = false;
+  if (CONFIG.dataUrl) { a = await loadBuilt(); ok = !a.error; }
+  if (!ok && CONFIG.directFallback) { const first = a; a = await runDirect(); a.fileError = first && first.error; ok = !a.error; }
+  LIVE.attempt = ok ? null : a;
+  LIVE.status = ok ? "live" : LIVE.at ? "cached" : "offline";
   renderStatus(); render();
 }
 function loadCache() {
   try {
     const c = JSON.parse(localStorage.getItem("afcra-sf-live") || "null");
-    if (c && c.staged && Date.now() - Date.parse(c.at) < CONFIG.cacheHours * 3600e3) { LIVE.staged = c.staged; LIVE.at = c.at; LIVE.cached = true; applyLive(c.staged); return true; }
+    if (c && c.staged && Array.isArray(c.jobs) && c.jobs.length === REGISTRY.length && c.jobs.every(j => j.status === "ok") && Date.now() - Date.parse(c.at) < CONFIG.cacheHours * 3600e3) { LIVE.staged = c.staged; LIVE.at = c.at; LIVE.jobs = c.jobs; LIVE.via = c.via; LIVE.sources = c.sources; LIVE.cached = true; applyLive(c.staged); return true; }
   } catch (e) {}
   return false;
 }
@@ -642,7 +673,7 @@ for (const c of DATA) {
   c.base.popm = c.pop;
   if (c.d.pc != null && c.pop) c.base.gdp = c.d.pc * c.pop / 1000;
   const t = TRADE_SNAP[c.iso]; if (t) { c.base.exp = t[0]; c.base.imp = t[1]; }
-  c.src = {}; c.series = {};
+  c.snap = { ...c.base }; c.src = {}; c.series = {};
   c.short = c.name.replace("Congo, Dem. Rep.","DR Congo").replace("Congo, Rep.","Congo").replace("Gambia, The","The Gambia")
     .replace("Central African Republic","CAR").replace("São Tomé and Príncipe","São Tomé").replace("Bosnia and Herzegovina","Bosnia")
     .replace("Holy See (Vatican City)","Holy See").replace("United Kingdom","UK").replace("Equatorial Guinea","Eq. Guinea");
@@ -673,9 +704,12 @@ function derive(c) {
 }
 function applyLive(staged) {
   for (const c of DATA) {
-    const s = staged[c.iso]; c.src = {}; c.series = {};
-    if (s) { Object.assign(c.base, s.v); c.src = { ...s.src }; c.series = { ...s.series };
-      if (has(s.v.fuel) || has(s.v.ores)) c.src.rx = s.src.fuel || s.src.ores; }
+    /* A live update replaces the snapshot outright: no snapshot value survives
+       alongside live ones. A series a sovereign doesn't publish shows as a gap. */
+    const s = staged[c.iso] || { v:{}, src:{}, series:{} };
+    c.base = Object.fromEntries(REGISTRY.map(r => [r.k, has(s.v[r.k]) ? s.v[r.k] : null]));
+    c.src = { ...s.src }; c.series = { ...s.series };
+    if (has(s.v.fuel) || has(s.v.ores)) c.src.rx = s.src.fuel || s.src.ores;
     derive(c);
   }
   MEDIAN_CACHE.clear();
@@ -912,13 +946,13 @@ function buildBar() {
 }
 function renderStatus() {
   const el = $("#status"), t = $("#status-t");
-  el.className = "status " + (LIVE.status === "live" ? "live" : LIVE.status === "partial" ? "partial" : LIVE.status === "loading" ? "loading" : "");
+  el.className = "status " + (LIVE.status === "live" ? "live" : LIVE.status === "cached" ? "cached" : LIVE.status === "loading" ? "loading" : "");
   const when = LIVE.at ? new Date(LIVE.at).toLocaleString("en-GB", { day:"numeric", month:"short", hour:"2-digit", minute:"2-digit" }) : null;
   t.textContent = LIVE.status === "loading" ? (LIVE.cached ? `Cached ${when}, refreshing` : "Connecting to live sources")
     : LIVE.status === "live" ? `Live data, ${when}`
-    : LIVE.status === "partial" ? `Partly live, ${when}`
+    : LIVE.status === "cached" ? `Last complete update, ${when}`
     : LIVE.cached ? `Cached data, ${when}` : `Offline: ${CONFIG.snapshotLabel}`;
-  $("#foot-src").textContent = LIVE.at ? `Sources: IMF World Economic Outlook and World Bank, retrieved ${when}. Not a credit rating.` : `Showing the ${CONFIG.snapshotLabel}. Not a credit rating.`;
+  $("#foot-src").textContent = LIVE.at ? `Sources: IMF World Economic Outlook${LIVE.sources?.imf ? ` (${LIVE.sources.imf})` : ""} and World Bank, complete update ${when}. Not a credit rating.` : `Showing the ${CONFIG.snapshotLabel}. Not a credit rating.`;
 }
 
 /* ======================================================================
@@ -1378,13 +1412,22 @@ function renderTrade() {
    ====================================================================== */
 function renderData() {
   const when = LIVE.at ? new Date(LIVE.at).toLocaleString("en-GB") : null;
-  $("#data-lead").textContent = LIVE.status === "loading" ? "Pulling the latest releases from the IMF and World Bank now."
-    : LIVE.at ? `Live figures retrieved ${when}${LIVE.cached && LIVE.status !== "live" ? " (cached)" : ""}. Every page load checks the sources again; the log shows each connector.`
-    : `The live sources could not be reached from this browser, so the tool is showing the ${CONFIG.snapshotLabel}. Refresh to try again.`;
-  const jobs = LIVE.jobs.length ? LIVE.jobs : REGISTRY.map(r => ({ ...r, status:"not run" }));
-  $("#log").innerHTML = `<thead><tr><th>Indicator</th><th>Source</th><th>Series code</th><th>Status</th><th class="n">Sovereigns</th><th class="n">Time</th><th>Source vintage</th></tr></thead><tbody>${jobs.map(j =>
-    `<tr><td>${esc(j.label)}</td><td>${PROVIDER[j.p]}</td><td><code>${j.code}</code></td><td class="${j.status === "ok" ? "st-ok" : j.status === "failed" ? "st-fail" : "st-wait"}">${j.status === "ok" ? "Loaded" : j.status === "failed" ? `Failed${j.error ? `: ${esc(j.error)}` : ""}` : j.status === "empty" ? "No data" : j.status === "running" ? "Loading" : j.status === "queued" ? "Queued" : "Not run"}</td><td class="n">${j.rows || "—"}</td><td class="n">${j.ms ? `${(j.ms / 1000).toFixed(1)} s` : "—"}</td><td>${esc(j.vintage || "—")}</td></tr>`).join("")}</tbody>`;
-  if (LIVE.quarantine.length) $("#log").insertAdjacentHTML("beforeend", `<tfoot><tr><td colspan="7" class="note">${LIVE.quarantine.length} value(s) failed the plausibility check and were held back: ${LIVE.quarantine.slice(0, 12).map(q => `${q.iso} ${q.k}`).join(", ")}.</td></tr></tfoot>`);
+  const via = LIVE.via === "file" ? "the scheduled data file" : "the IMF and World Bank APIs";
+  $("#data-lead").textContent = LIVE.status === "loading" ? "Checking for the latest complete update from the IMF and World Bank."
+    : LIVE.status === "live" ? `Every figure comes from one complete update, retrieved ${when} from ${via}. Updates are all or nothing: a new pull is applied only when every series loads.`
+    : LIVE.status === "cached" ? `The latest check did not return a complete set, so nothing was changed. Every figure comes from the last complete update, ${when}.`
+    : `No complete live update is available in this browser, so every figure comes from the ${CONFIG.snapshotLabel}. Nothing is mixed.`;
+  const logTable = (jobs, caption) => `<caption style="text-align:left;padding:10px 10px 4px;font-family:var(--serif);font-size:17px">${caption}</caption>
+    <thead><tr><th>Indicator</th><th>Source</th><th>Series code</th><th>Status</th><th class="n">Sovereigns</th><th class="n">Minimum</th><th>Source vintage</th></tr></thead><tbody>${jobs.map(j =>
+    `<tr><td>${esc(j.label)}</td><td>${PROVIDER[j.p]}${j.route ? `<span class="sub">${esc(j.route)}</span>` : ""}</td><td><code>${j.code}</code></td><td class="${j.status === "ok" ? "st-ok" : j.status === "failed" || j.status === "short" ? "st-fail" : "st-wait"}">${
+      j.status === "ok" ? "Loaded" : j.status === "failed" ? `Failed${j.error ? `: ${esc(j.error)}` : ""}` : j.status === "short" ? `Incomplete: ${esc(j.error || "")}` : j.status === "running" ? "Loading" : j.status === "queued" ? "Queued" : "Not run"}</td><td class="n">${j.rows || "—"}</td><td class="n">${j.min}</td><td>${esc(j.vintage || "—")}</td></tr>`).join("")}</tbody>`;
+  const att = LIVE.attempt;
+  let html = "";
+  if (att && att.jobs && att.jobs.length && (LIVE.status !== "live")) html += logTable(att.jobs, `Latest check: not applied${att.fileError ? ` (data file: ${esc(att.fileError)})` : ""}`);
+  if (LIVE.jobs.length && LIVE.status !== "loading") html += logTable(LIVE.jobs, `Update in use, ${when}`);
+  if (!html) html = logTable(REGISTRY.map(r => ({ ...r, status: LIVE.status === "loading" ? "queued" : "not run" })), "Series");
+  $("#log").innerHTML = html;
+  if (LIVE.quarantine.length && LIVE.status === "live") $("#log").insertAdjacentHTML("beforeend", `<tfoot><tr><td colspan="7" class="note">${LIVE.quarantine.length} value(s) failed the plausibility check and were held back (the sovereign shows as not published for that series): ${LIVE.quarantine.slice(0, 12).map(q => `${q.iso} ${q.k}`).join(", ")}.</td></tr></tfoot>`);
   $("#refresh").disabled = LIVE.status === "loading"; $("#refresh").onclick = () => runIngestion();
   $("#defs").innerHTML = `<thead><tr><th>Indicator</th><th>Unit</th><th>Definition and source</th></tr></thead><tbody>${[...MAP_METRICS, "imp"].map(k => {
     const reg = REGISTRY.find(r => r.k === k), src = reg ? `${PROVIDER[reg.p]} <code>${reg.code}</code>` : k === "drev" ? "Derived: <code>GGXWDG_NGDP ÷ GGR_NGDP</code>" : k === "rx" ? "Derived: <code>TX.VAL.FUEL.ZS.UN + TX.VAL.MMTL.ZS.UN</code>" : k === "pc" ? "Derived: <code>NGDPD ÷ LP</code>" : "";
