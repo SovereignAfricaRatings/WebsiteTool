@@ -403,7 +403,8 @@ dl.facts dt{color:var(--muted)} dl.facts dd{margin:0}
       </section>
 
       <section class="screen" data-screen="data" hidden>
-        <div class="scr-head"><div><h2>Data and methodology</h2><p id="data-lead"></p></div><button class="btn pri" type="button" id="refresh">Check for a new update</button></div>
+        <div class="scr-head"><div><h2>Data and methodology</h2><p id="data-lead"></p></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" type="button" id="probe">Test connections</button><button class="btn pri" type="button" id="refresh">Check for a new update</button></div></div>
+        <div id="probe-out"></div>
         <div class="panel tbl-wrap"><table class="log" id="log"></table></div>
         <h3 class="sec-t">Indicator definitions</h3>
         <div class="panel tbl-wrap"><table class="defs" id="defs"></table></div>
@@ -419,7 +420,7 @@ dl.facts dt{color:var(--muted)} dl.facts dd{margin:0}
         <div id="cta-wrap" style="margin-top:14px"></div>
         <div class="docs" style="margin-top:26px">
           <div><h3>How the figures are built</h3><p>Headline fiscal, current-account, growth and inflation figures are three-year averages of the latest actual years; debt and revenue are the latest actual year. IMF projections appear only in trend charts, shaded. Debt to revenue divides gross debt by revenue. Dollar values multiply a published ratio by nominal GDP. Continental figures are ratios of continental totals, so larger economies weigh more; reserve cover is weighted by imports and resource dependence by exports.</p>
-          <p>Updates are all or nothing. A scheduled job pulls every series from the IMF and World Bank, checks each value for plausibility and each series for coverage, and publishes a new data file only when the whole set is complete. If any source fails, the previous complete update stays in use, so figures from different pulls are never mixed.</p></div>
+          <p>Updates are all or nothing. IMF figures come from the official World Economic Outlook database, which the IMF revises each April and October; World Bank figures are pulled from its API on every run. A scheduled job gathers every series from the IMF and World Bank, checks each value for plausibility and each series for coverage, and publishes a new data file only when the whole set is complete. If any source fails, the previous complete update stays in use, so figures from different pulls are never mixed.</p></div>
           <div><h3>What is left out, and why</h3><p>Euro-area members hold reserves within the euro system, so national reserve cover is shown as not applicable. External debt comes from World Bank debt statistics, which cover low- and middle-income economies only. Where a sovereign does not publish a series, the gap is shown rather than estimated.</p>
           <h3>What this tool is not</h3><p>Nothing here is a credit rating, a rating outlook or an indication of one, and nothing here is investment advice. AfCRA's ratings are issued only through its formal rating process.</p></div>
         </div>
@@ -439,11 +440,13 @@ const CONFIG = {
   /* Primary feed: the complete data file produced by build-data.mjs on a
      schedule and hosted next to this page. Loaded all or nothing. */
   dataUrl: "sovereign-data.json",
-  /* If that file can't be loaded, try the public APIs from the browser.
-     Also all or nothing: applied only if every series loads. */
+  /* Load live data straight from the public sources in the visitor's
+     browser. No server or setup needed. All or nothing, as above. */
   directFallback: true,
   sources: {
-    imf: "https://www.imf.org/external/datamapper/api/v1",
+    dbnomics: "https://api.db.nomics.world/v22",                 // IMF WEO mirror, route 1
+    imf: "https://www.imf.org/external/datamapper/api/v1",       // IMF DataMapper, route 2
+    imfSdmx: "https://api.imf.org/external/sdmx/3.0",            // IMF data portal, route 3
     wb: "https://api.worldbank.org/v2",
   },
   live: true,                    // false = serve the embedded snapshot only
@@ -532,23 +535,75 @@ async function fetchJson(url, { retries = 2, pace = 0, timeout = 25000 } = {}) {
   }
   throw last;
 }
+/* The IMF's World Economic Outlook is reachable by several routes. Each is
+   tried in turn; the first that answers is kept for the rest of the pull. */
+const IMF_ROUTES = [
+  { name:"DBnomics (IMF WEO mirror)", async get(code) {
+      const base = CONFIG.sources.dbnomics, dims = encodeURIComponent(JSON.stringify({ "weo-subject":[code] }));
+      let json = await fetchJson(`${base}/series/IMF/WEO:latest?dimensions=${dims}&observations=1&limit=1000&format=json`, { retries:1 });
+      let docs = json?.series?.docs || [];
+      if (!docs.length) { json = await fetchJson(`${base}/series/IMF/WEO:latest?q=${code}&observations=1&limit=1000&format=json`, { retries:1 }); docs = (json?.series?.docs || []).filter(d => String(d.series_code).split(".")[1] === code); }
+      if (!docs.length) throw new Error(`no series for ${code}`);
+      const out = {};
+      for (const d of docs) {
+        const raw = d.dimensions?.["weo-country"] || String(d.series_code).split(".")[0], iso = IMF_ALIAS[raw] || raw;
+        if (!BY[iso] || !Array.isArray(d.period)) continue;
+        d.period.forEach((p, i) => { const v = parseFloat(d.value?.[i]); if (isFinite(v)) (out[iso] = out[iso] || {})[parseInt(p, 10)] = v; });
+      }
+      return { data:out, vintage:`IMF WEO via DBnomics (${docs[0]?.dataset_code || "latest"})` };
+  } },
+  { name:"IMF DataMapper", async get(code) {
+      const json = await fetchJson(`${CONFIG.sources.imf}/${code}`, { retries:1 });
+      const block = json?.values?.[code]; if (!block) throw new Error(`no values for ${code}`);
+      const out = {};
+      for (const [raw, s] of Object.entries(block)) { const iso = IMF_ALIAS[raw] || raw;
+        if (BY[iso]) out[iso] = Object.fromEntries(Object.entries(s).map(([y, v]) => [+y, +v]).filter(([, v]) => isFinite(v))); }
+      return { data:out, vintage: json?.api?.version || "IMF WEO (DataMapper)" };
+  } },
+  { name:"IMF data portal (SDMX)", async get(code) {
+      let text = null, err;
+      for (const ver of ["+", "~"]) {
+        try { const r = await fetch(`${CONFIG.sources.imfSdmx}/data/dataflow/IMF.RES/WEO/${ver}/*.${code}.A?c[TIME_PERIOD]=ge:2008`, { headers:{ Accept:"text/csv" } });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`); text = await r.text(); break; } catch (e) { err = e; }
+      }
+      if (text == null) throw err;
+      const lines = text.trim().split(/\r?\n/).map(l => l.split(",").map(x => x.replace(/^"|"$/g, "")));
+      const h = lines[0].map(x => x.toUpperCase()), ci = ["COUNTRY","REF_AREA"].map(n => h.indexOf(n)).find(i => i >= 0), ti = h.indexOf("TIME_PERIOD"), vi = h.indexOf("OBS_VALUE");
+      if (ci == null || ti < 0 || vi < 0) throw new Error("unexpected response layout");
+      const out = {};
+      for (const r of lines.slice(1)) { const iso = IMF_ALIAS[r[ci]] || r[ci], y = parseInt(r[ti], 10), v = parseFloat(r[vi]);
+        if (BY[iso] && isFinite(y) && isFinite(v)) (out[iso] = out[iso] || {})[y] = v; }
+      return { data:out, vintage:"IMF WEO (data portal)" };
+  } },
+];
+/* Same series can arrive in dollars or billions, persons or millions. */
+function normaliseImf(code, data) {
+  const lat = Object.values(data).map(s => { const ys = Object.keys(s).map(Number).filter(y => y <= ACTUAL_TO).sort((a, b) => b - a); return ys.length ? s[ys[0]] : NaN; }).filter(isFinite).sort((a, b) => a - b);
+  const med = lat.length ? lat[Math.floor(lat.length / 2)] : 0;
+  const f = code === "NGDPD" && med > 1e6 ? 1e-9 : code === "LP" && med > 1e4 ? 1e-6 : 1;
+  if (f !== 1) for (const s of Object.values(data)) for (const y of Object.keys(s)) s[y] *= f;
+  return data;
+}
+let IMF_ROUTE = null;                              // route that answered during this pull
 const CONNECTORS = {
-  async IMF(code) {
-    const json = await fetchJson(`${CONFIG.sources.imf}/${code}`, { pace:250 });
-    const block = json?.values?.[code];
-    if (!block) throw new Error(`IMF returned no values for ${code}`);
-    const out = {};
-    for (const [raw, series] of Object.entries(block)) {
-      const iso = IMF_ALIAS[raw] || raw;
-      if (BY[iso]) out[iso] = Object.fromEntries(Object.entries(series).map(([y, v]) => [+y, +v]).filter(([, v]) => isFinite(v)));
+  async IMF(code, min) {
+    const order = IMF_ROUTE ? [IMF_ROUTE, ...IMF_ROUTES.filter(r => r !== IMF_ROUTE)] : IMF_ROUTES;
+    const errs = [];
+    for (const r of order) {
+      if (r.down) { errs.push(`${r.name}: unreachable`); continue; }
+      try {
+        const res = await r.get(code); res.data = normaliseImf(code, res.data);
+        const n = Object.keys(res.data).length; if (n < min) throw new Error(`only ${n} sovereigns`);
+        IMF_ROUTE = r; res.route = r.name; return res;
+      } catch (e) { if (e instanceof TypeError || e?.name === "AbortError") r.down = true; errs.push(`${r.name}: ${e.message}`); }
     }
-    return { data:out, vintage: json?.api?.version || null };
+    throw new Error(errs.join(" | "));
   },
   async WB(code) {
     const out = {}; let vintage = null;
     const isos = DATA.filter(c => c.iso !== "VAT").map(c => c.iso);
-    for (let i = 0; i < isos.length; i += 55) {
-      const url = `${CONFIG.sources.wb}/country/${isos.slice(i, i + 55).join(";")}/indicator/${code}?format=json&per_page=5000&date=2010:${NOW_Y}`;
+    for (let i = 0; i < isos.length; i += 40) {
+      const url = `${CONFIG.sources.wb}/country/${isos.slice(i, i + 40).join(";")}/indicator/${code}?format=json&per_page=5000&date=2010:${NOW_Y}`;
       const json = await fetchJson(url);
       if (!Array.isArray(json)) throw new Error("World Bank: unexpected response shape");
       if (json.length < 2 || !Array.isArray(json[1])) { const m = json[0]?.message?.[0]; throw new Error(`World Bank rejected ${code}${m ? `: ${m.value}` : ""}`); }
@@ -559,9 +614,26 @@ const CONNECTORS = {
         (out[iso] = out[iso] || {})[+r.date] = +r.value;
       }
     }
-    return { data:out, vintage };
+    return { data:out, vintage, route:"World Bank API" };
   },
 };
+/* One small request per route, to show exactly what this browser can reach. */
+async function testConnections() {
+  const s = CONFIG.sources, dims = encodeURIComponent(JSON.stringify({ "weo-subject":["GGXWDG_NGDP"], "weo-country":["ZAF"] }));
+  const probes = [
+    ["World Bank API", `${s.wb}/country/ZAF/indicator/NY.GDP.MKTP.CD?format=json&mrv=1`],
+    ["DBnomics (IMF WEO mirror)", `${s.dbnomics}/series/IMF/WEO:latest?dimensions=${dims}&observations=1&limit=1&format=json`],
+    ["IMF DataMapper", `${s.imf}/GGXWDG_NGDP/ZAF`],
+    ["IMF data portal (SDMX)", `${s.imfSdmx}/data/dataflow/IMF.RES/WEO/+/ZAF.GGXWDG_NGDP.A`],
+  ];
+  return Promise.all(probes.map(async ([name, url]) => {
+    const t0 = performance.now(), ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 15000);
+    try { const r = await fetch(url, { signal:ctl.signal }); const ms = Math.round(performance.now() - t0);
+      return { name, ok:r.ok, msg: r.ok ? `Reachable (${ms} ms)` : `Refused: HTTP ${r.status}` }; }
+    catch (e) { return { name, ok:false, msg: e.name === "AbortError" ? "No answer within 15 seconds" : "Blocked by the browser or unreachable from this network" }; }
+    finally { clearTimeout(timer); }
+  }));
+}
 function transform(series, t, provider) {
   const pairs = Object.entries(series || {}).map(([y, v]) => [+y, v]).filter(([, v]) => isFinite(v)).sort((a, b) => a[0] - b[0]);
   const actual = provider === "IMF" ? pairs.filter(([y]) => y <= ACTUAL_TO) : pairs;
@@ -601,8 +673,8 @@ async function runDirect() {
     if (down[job.p]) { job.status = "failed"; job.error = "source unreachable from this browser"; return; }
     job.status = "running"; const t0 = performance.now();
     try {
-      const { data, vintage } = await CONNECTORS[job.p](job.code);
-      job.vintage = vintage;
+      const { data, vintage, route:via } = await CONNECTORS[job.p](job.code, job.min);
+      job.vintage = vintage; job.route = via;
       for (const [iso, series] of Object.entries(data)) {
         const r = transform(series, job.t, job.p);
         if (!r) continue;
@@ -613,10 +685,11 @@ async function runDirect() {
       }
       job.status = job.rows >= job.min ? "ok" : "short";
       if (job.status === "short") job.error = `covered ${job.rows}, minimum ${job.min}`;
-    } catch (e) { job.status = "failed"; job.error = e?.message || String(e); if (e instanceof TypeError || e?.name === "AbortError") down[job.p] = true; }
+    } catch (e) { job.status = "failed"; job.error = e?.message || String(e); if (job.p === "WB" && (e instanceof TypeError || e?.name === "AbortError")) down.WB = true; if (job.p === "IMF" && IMF_ROUTES.every(r => r.down)) down.IMF = true; }
     job.ms = Math.round(performance.now() - t0);
     if (route.screen === "data") renderData();
   };
+  IMF_ROUTE = null; IMF_ROUTES.forEach(r => r.down = false);
   const imfJobs = jobs.filter(j => j.p === "IMF"), wbJobs = jobs.filter(j => j.p === "WB");
   await Promise.all([(async () => { for (const j of imfJobs) await run(j); })(),
     (async () => { const q = [...wbJobs]; await Promise.all([0,1,2].map(async () => { while (q.length) await run(q.shift()); })); })()]);
@@ -1429,6 +1502,13 @@ function renderData() {
   $("#log").innerHTML = html;
   if (LIVE.quarantine.length && LIVE.status === "live") $("#log").insertAdjacentHTML("beforeend", `<tfoot><tr><td colspan="7" class="note">${LIVE.quarantine.length} value(s) failed the plausibility check and were held back (the sovereign shows as not published for that series): ${LIVE.quarantine.slice(0, 12).map(q => `${q.iso} ${q.k}`).join(", ")}.</td></tr></tfoot>`);
   $("#refresh").disabled = LIVE.status === "loading"; $("#refresh").onclick = () => runIngestion();
+  $("#probe").onclick = async () => {
+    const out = $("#probe-out"); out.innerHTML = `<div class="panel" style="padding:12px 14px;margin-bottom:14px">Testing each source from this browser…</div>`;
+    const res = await testConnections();
+    out.innerHTML = `<div class="panel" style="padding:12px 14px 6px;margin-bottom:14px"><h3 style="font-size:17px;margin-bottom:6px">Connection test <span class="note">(${esc(location.protocol === "file:" ? "page opened as a file on this computer" : location.host)}, ${new Date().toLocaleString("en-GB")})</span></h3>
+      <table class="log"><tbody>${res.map(r => `<tr><td>${esc(r.name)}</td><td class="${r.ok ? "st-ok" : "st-fail"}">${esc(r.msg)}</td></tr>`).join("")}</tbody></table>
+      <p class="note" style="margin:8px 0 6px">The tool goes live when the World Bank and at least one IMF route are reachable.</p></div>`;
+  };
   $("#defs").innerHTML = `<thead><tr><th>Indicator</th><th>Unit</th><th>Definition and source</th></tr></thead><tbody>${[...MAP_METRICS, "imp"].map(k => {
     const reg = REGISTRY.find(r => r.k === k), src = reg ? `${PROVIDER[reg.p]} <code>${reg.code}</code>` : k === "drev" ? "Derived: <code>GGXWDG_NGDP ÷ GGR_NGDP</code>" : k === "rx" ? "Derived: <code>TX.VAL.FUEL.ZS.UN + TX.VAL.MMTL.ZS.UN</code>" : k === "pc" ? "Derived: <code>NGDPD ÷ LP</code>" : "";
     return `<tr><td><strong>${M[k].label}</strong></td><td>${M[k].unit}</td><td>${M[k].def} ${src}</td></tr>`; }).join("")}</tbody>`;
